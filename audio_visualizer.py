@@ -15,3 +15,18 @@ WIDTH, HEIGHT = 1000, 500
 FPS = 60
 
 audio_buffer = np.zeros(BLOCK_SIZE, dtype=np.float32)
+
+def audio_callback(indata, frames, time_info, status):
+    global audio_buffer
+    audio_buffer = indata[:, 0].copy()
+
+fft_freqs = np.fft.rfftfreq(BLOCK_SIZE, d=1.0 / SAMPLE_RATE)
+bar_edges = np.logspace(np.log10(MIN_FREQ), np.log10(MAX_FREQ), NUM_BARS + 1)
+
+bar_bins = []
+for i in range(NUM_BARS):
+    lo = np.searchsorted(fft_freqs, bar_edges[i])
+    hi = max(lo + 1, np.searchsorted(fft_freqs, bar_edges[i + 1]))
+    bar_bins.append((lo, hi))
+
+window = np.hanning(BLOCK_SIZE).astype(np.float32)
