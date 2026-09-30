@@ -1,28 +1,23 @@
-"""
-audio visualizer: MICROPHONE, AUDIO FILE, or a HAND-PLAYED REVERB SYNTH.
-
-Install:  py -m pip install numpy sounddevice soundfile pygame-ce
-Hand synth also needs Python 3.12 plus opencv-python and mediapipe==0.10.21:
-          py -3.12 -m pip install numpy sounddevice soundfile pygame-ce opencv-python mediapipe==0.10.21
-Run:      py audio_visualizer.py        (use  py -3.12 audio_visualizer.py  for hand synth)
-
-Menu:      click a row, or press 1 (microphone) / 2 (audio file) / 3 (hand synth) /
-           4 (rhythm game), ESC to quit
-Visuals:   ESC returns to the menu
-File mode: SPACE = pause/resume, LEFT/RIGHT = seek 5 seconds
-           Supported files: wav, mp3, flac, ogg
-
-Hand synth (a big, dreamy, reverb-soaked pad):
-    RIGHT hand: height = pitch (snapped to a scale), pinch open/closed = brightness
-    LEFT hand:  height = volume,                      pinch open/closed = reverb amount
-    (pinch = distance between thumb tip and index fingertip)
-    S = change scale, LEFT/RIGHT = change key, SPACE = mute
-
-Rhythm game: pick any song, it builds a chart from the music itself, and you play it.
-    D F J K = hit the four lanes (tap short notes, HOLD the key down on long ones until
-    the tail ends), UP/DOWN = note speed, LEFT/RIGHT = nudge timing,
-    ESC = pause (ENTER resume, R restart, Q quit)
-"""
+# audio visualizer - mic, audio file, or a hand controlled synth (+ a rhythm game)
+#
+# install: py -m pip install numpy sounddevice soundfile pygame-ce
+# hand synth needs python 3.12 + opencv + mediapipe 0.10.21:
+#   py -3.12 -m pip install numpy sounddevice soundfile pygame-ce opencv-python mediapipe==0.10.21
+# run: py audio_visualizer.py   (py -3.12 audio_visualizer.py for hand synth)
+#
+# menu: click or press 1/2/3/4, esc quits
+# esc in any mode goes back to menu
+# file mode: space pause, left/right seek 5s (wav mp3 flac ogg)
+#
+# hand synth:
+#   right hand - height = pitch, pinch = brightness
+#   left hand  - height = volume, pinch = reverb
+#   s = scale, left/right = key, space = mute
+#
+# rhythm game: pick a song, it makes a chart from it
+#   d f j k to hit (hold on long notes), up/down speed, left/right offset
+#   esc pause (enter resume, r restart, q quit)
+#   5 difficulties, expert + insane have a life bar
 
 import bisect
 import faulthandler
@@ -37,10 +32,9 @@ import pygame
 import sounddevice as sd
 import soundfile as sf
 
-faulthandler.enable()      # if Python ever crashes hard, print where (in the terminal)
+faulthandler.enable()  # so hard crashes print something
 
-# Hand synth needs extra packages. If they're missing (or you're on a Python
-# version MediaPipe doesn't support), the mic and file modes still work fine.
+# hand synth stuff is optional, other modes work without it
 try:
     import cv2
     import mediapipe as mp
@@ -50,38 +44,37 @@ except Exception as err:
     cv2 = mp = mp_hands = None
     HAND_ERROR = f"{type(err).__name__}: {err}"
 
-# ---------------------------------------------------------------- settings --
-BLOCK_SIZE = 2048        # samples analysed per frame (bigger = better bass detail)
+# settings
+BLOCK_SIZE = 2048  # bigger = better bass
 MIC_SAMPLE_RATE = 44100
-INPUT_DEVICE = None      # None = system default mic, or a device number from sd.query_devices()
-START_TIMEOUT = 10       # seconds to wait for audio/camera to open before giving up
+INPUT_DEVICE = None  # None = default mic
+START_TIMEOUT = 10
 NUM_BARS = 48
 MIN_FREQ = 40
 MAX_FREQ = 12000
-TILT_DB = 12             # file mode only: boost highs by up to this many dB
-FALL_SPEED = 0.03        # how fast bars drop per frame
+TILT_DB = 12  # boost highs in file mode
+FALL_SPEED = 0.03
 
 WIDTH, HEIGHT = 1120, 660
 FPS = 60
 SEEK_SECONDS = 5
 
-# --- hand synth settings ---
+# hand synth settings
 SYNTH_SAMPLE_RATE = 44100
-AUDIO_BLOCK = 1024           # the reverb works in blocks this size (about 23 ms)
-MASTER_VOLUME = 0.22         # overall loudness (0..1)
-NUM_OCTAVES = 3              # pitch range of the right hand
-DETUNE_CENTS = [-13, -6.5, 0, 6.5, 13]   # 5 slightly detuned voices = wide, lush pad
-NUM_HARMONICS = 20           # how many overtones each voice can have
-SUB_LEVEL = 0.4              # deep sine one octave below
-ATTACK = 0.06                # how fast notes swell in (per block, smaller = slower)
-RELEASE = 0.03               # how fast notes fade out
-GLIDE = 0.2                  # how fast the pitch slides between notes
-REVERB_SECONDS = 3.0         # length of the reverb tail (lower it if audio crackles)
+AUDIO_BLOCK = 1024
+MASTER_VOLUME = 0.22
+NUM_OCTAVES = 3
+DETUNE_CENTS = [-13, -6.5, 0, 6.5, 13]  # 5 voices
+NUM_HARMONICS = 20
+SUB_LEVEL = 0.4
+ATTACK = 0.06
+RELEASE = 0.03
+GLIDE = 0.2
+REVERB_SECONDS = 3.0  # lower if it crackles
 CAMERA_INDEX = 0
-# The usable band of the camera image (0 = top, 1 = bottom). Keeping the
-# extremes out of range means you don't have to reach the very edge of the frame.
+# dont use the very top/bottom of the camera
 Y_TOP, Y_BOTTOM = 0.12, 0.88
-HYSTERESIS = 0.15            # stops notes flickering when your hand sits on a boundary
+HYSTERESIS = 0.15  # stops note flicker
 DETUNE_RATIOS = 2 ** (np.array(DETUNE_CENTS) / 1200)
 HARMONICS = np.arange(1, NUM_HARMONICS + 1)
 
@@ -91,13 +84,11 @@ SCALES = {
     "Major": [0, 2, 4, 5, 7, 9, 11],
     "Natural minor": [0, 2, 3, 5, 7, 8, 10],
     "Chromatic": list(range(12)),
-    "Free glide": None,      # no snapping, like a real theremin
+    "Free glide": None,  # no snapping
 }
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-# ------------------------------------------------------------------- theme --
-# Light editorial look: paper white, dot grid, sky-blue panels, black ink, and
-# one small red accent.
+# colors
 PAPER = (243, 245, 248)
 INK = (14, 16, 24)
 BLUE = (28, 108, 236)
@@ -108,16 +99,16 @@ DOT = (198, 204, 214)
 RED = (236, 64, 84)
 WHITE = (255, 255, 255)
 
-PANEL = pygame.Rect(40, 96, WIDTH - 80, HEIGHT - 96 - 60)   # main visual panel
+PANEL = pygame.Rect(40, 96, WIDTH - 80, HEIGHT - 96 - 60)
 HAND_PANEL = pygame.Rect(340, 96, WIDTH - 340 - 40, HEIGHT - 96 - 60)
 MENU_PANEL = pygame.Rect(580, 96, WIDTH - 580 - 40, HEIGHT - 96 - 60)
 
-FONT_TITLE = FONT_ROW = FONT_UI = FONT_MONO = FONT_TINY = FONT_HUGE = FONT_BIG = None
+FONT_TITLE = FONT_ROW = FONT_UI = FONT_MONO = FONT_TINY = FONT_HUGE = FONT_BIG = FONT_MID = None
 
 
 def init_theme():
-    """Load fonts (call after pygame.init). Falls back to pygame's default font."""
-    global FONT_TITLE, FONT_ROW, FONT_UI, FONT_MONO, FONT_TINY, FONT_HUGE, FONT_BIG
+    # has to run after pygame init
+    global FONT_TITLE, FONT_ROW, FONT_UI, FONT_MONO, FONT_TINY, FONT_HUGE, FONT_BIG, FONT_MID
     sans = "helveticaneue,helvetica,arial,segoeui"
     mono = "consolas,menlo,couriernew,monospace"
     FONT_TITLE = pygame.font.SysFont(sans, 52, bold=True)
@@ -125,6 +116,7 @@ def init_theme():
     FONT_UI = pygame.font.SysFont(sans, 22, bold=True)
     FONT_HUGE = pygame.font.SysFont(sans, 104, bold=True)
     FONT_BIG = pygame.font.SysFont(sans, 72, bold=True)
+    FONT_MID = pygame.font.SysFont(sans, 32, bold=True)
     FONT_MONO = pygame.font.SysFont(mono, 15)
     FONT_TINY = pygame.font.SysFont(mono, 12)
 
@@ -156,7 +148,7 @@ def draw_text(screen, font, s, pos, color=INK, anchor="topleft"):
 
 
 def draw_label(screen, font, s, pos, color=INK, bg=PAPER, anchor="topleft", pad=5):
-    """Text on a little paper sticker, so it stays readable over anything."""
+    # text with a background box behind it
     surf = render_text(font, s, color)
     rect = surf.get_rect(**{anchor: pos})
     pygame.draw.rect(screen, bg, rect.inflate(pad * 2, pad))
@@ -170,7 +162,7 @@ def draw_cross(screen, x, y, size=6, color=INK):
 
 
 def get_paper():
-    """Off-white background with a faint dot grid (built once)."""
+    # background w/ dot grid, cached
     if "paper" not in _cache:
         surf = pygame.Surface((WIDTH, HEIGHT))
         surf.fill(PAPER)
@@ -182,7 +174,6 @@ def get_paper():
 
 
 def get_sky(size):
-    """Blue sky gradient with soft clouds (built once per size)."""
     key = ("sky", tuple(size))
     if key not in _cache:
         w, h = size
@@ -190,7 +181,7 @@ def get_sky(size):
         for y in range(h):
             pygame.draw.line(surf, lerp_color(SKY_TOP, SKY_BOTTOM, y / max(1, h - 1)),
                              (0, y), (w, y))
-        # Draw blobs on a tiny surface, then scale up: the smoothing makes clouds.
+        # clouds: draw circles small then scale up so they blur
         small = pygame.Surface((max(2, w // 10), max(2, h // 10)), pygame.SRCALPHA)
         rng = random.Random(3)
         sw, sh = small.get_size()
@@ -212,10 +203,10 @@ def draw_panel(screen, rect):
 
 
 def draw_chrome(screen, title, info_lines, footer_left="", footer_right=""):
-    """The frame every screen shares: paper, title, ruler, footer."""
+    # stuff every screen has (bg, title, ruler, footer)
     screen.blit(get_paper(), (0, 0))
 
-    # black strip down the left edge, like a film-leader marker
+    # left edge decoration
     pygame.draw.rect(screen, INK, (0, 200, 12, 210))
     for k in range(6):
         pygame.draw.rect(screen, INK, (18, 206 + k * 9, 7, 3))
@@ -226,7 +217,7 @@ def draw_chrome(screen, title, info_lines, footer_left="", footer_right=""):
     for i, line in enumerate(info_lines):
         draw_text(screen, FONT_TINY, line, (WIDTH - 40, 24 + i * 15), INK, "topright")
 
-    # ruler under the title
+    # ruler
     y = 82
     pygame.draw.line(screen, INK, (40, y), (WIDTH - 40, y), 1)
     for x in range(40, WIDTH - 39, 10):
@@ -237,11 +228,11 @@ def draw_chrome(screen, title, info_lines, footer_left="", footer_right=""):
     draw_text(screen, FONT_TINY, footer_right, (WIDTH - 40, HEIGHT - 34), INK, "topright")
 
 
-# ---------------------------------------------------------------- analysis --
+# fft stuff
 WINDOW = np.hanning(BLOCK_SIZE).astype(np.float32)
 
 def build_bar_bins(sample_rate):
-    """Work out which FFT bins belong to each bar (depends on the sample rate)."""
+    # which fft bins go in which bar
     freqs = np.fft.rfftfreq(BLOCK_SIZE, d=1.0 / sample_rate)
     edges = np.logspace(np.log10(MIN_FREQ), np.log10(MAX_FREQ), NUM_BARS + 1)
     bins = []
@@ -253,7 +244,7 @@ def build_bar_bins(sample_rate):
 
 
 def compute_bars(samples, bar_bins, db_floor, db_ceil, tilt):
-    """Turn a chunk of samples into NUM_BARS values between 0.0 and 1.0."""
+    # samples -> bar heights 0 to 1
     spectrum = np.abs(np.fft.rfft(samples * WINDOW)) / BLOCK_SIZE
     levels = np.array([spectrum[lo:hi].max() for lo, hi in bar_bins])
     db = 20 * np.log10(levels + 1e-9) + tilt
@@ -266,39 +257,35 @@ def pad_to_block(segment):
     return segment
 
 
-# ----------------------------------------------------------- audio sources --
-# Every source offers the same interface, so the visualizer doesn't care which
-# one it's drawing:  start(), stop(), get_segment(), handle_key(key),
-# plus the attributes name, hint, sample_rate, finished, db_floor, db_ceil, tilt.
-# The Source base class adds optional hooks that only some sources use.
+# audio sources
+# all of them have start/stop/get_segment/handle_key so the visualizer
+# doesnt care which one it is
 
 class Source:
     finished = False
-    panel = PANEL                # where the sky, bars and camera are drawn
-    bar_max_frac = 0.92          # how much of the panel the tallest bar may use
-    show_glitch = True           # the little blue "glitch" bars in the corner
+    panel = PANEL
+    bar_max_frac = 0.92
+    show_glitch = True
 
     def update(self):
-        """Called once per frame before drawing."""
+        pass
 
     def draw_background(self, screen, panel):
-        """Draw under the bars (the hand synth draws its camera here)."""
+        pass
 
     def draw_overlay(self, screen, panel):
-        """Draw extra things on top of the bars."""
+        pass
 
     def handle_key(self, key):
         pass
 
 
 class MicSource(Source):
-    """Live audio from the default microphone."""
-
     name = "microphone"
     hint = "ESC = MENU"
-    db_floor = -90       # mic signals are quieter, so the range is more sensitive
+    db_floor = -90  # mic is quieter
     db_ceil = -40
-    tilt = np.zeros(NUM_BARS)   # no frequency boost for the mic
+    tilt = np.zeros(NUM_BARS)
     sample_rate = MIC_SAMPLE_RATE
     finished = False
 
@@ -324,16 +311,13 @@ class MicSource(Source):
         return pad_to_block(self.buffer)
 
     def draw_overlay(self, screen, panel):
-        # blinking red dot + LIVE
         rect = draw_label(screen, FONT_TINY, "LIVE INPUT", (panel.right - 18, panel.top + 16),
                           INK, PAPER, "topright")
-        if (pygame.time.get_ticks() // 600) % 2 == 0:
+        if (pygame.time.get_ticks() // 600) % 2 == 0:  # blink
             pygame.draw.circle(screen, RED, (rect.left - 12, rect.centery), 4)
 
 
 class FileSource(Source):
-    """Plays an audio file and hands the visualizer whatever is playing now."""
-
     hint = "SPACE = PAUSE     LEFT / RIGHT = SEEK 5S     ESC = MENU"
     db_floor = -80
     db_ceil = -20
@@ -343,22 +327,22 @@ class FileSource(Source):
         base = os.path.splitext(os.path.basename(path))[0].lower()
         self.name = base if len(base) <= 26 else base[:24] + ".."
         self.data, self.sample_rate = sf.read(path, dtype="float32", always_2d=True)
-        self.mono = self.data.mean(axis=1)    # merged channels, for analysis
-        self.pos = 0                          # index of the next sample to play
+        self.mono = self.data.mean(axis=1)
+        self.pos = 0
         self.paused = False
         self.finished = False
         self.lag = 0
         self.stream = None
 
     def _callback(self, outdata, frames, time_info, status):
-        """Runs on a background thread whenever the speakers need more audio."""
+        # runs on the audio thread
         outdata.fill(0)
         if self.paused:
             return
         chunk = self.data[self.pos:self.pos + frames]
         outdata[:len(chunk)] = chunk
         self.pos += len(chunk)
-        if len(chunk) < frames:               # ran out of song
+        if len(chunk) < frames:  # song over
             self.finished = True
             raise sd.CallbackStop
 
@@ -399,7 +383,7 @@ class FileSource(Source):
         if self.paused:
             draw_label(screen, FONT_TINY, "PAUSED", (panel.right - 18, panel.top + 42),
                        WHITE, RED, "topright")
-        # thin progress line along the top of the panel
+        # progress bar
         x0, x1, y = panel.left + 18, panel.right - 18, panel.top + 8
         pygame.draw.line(screen, INK, (x0, y), (x1, y), 1)
         px = int(x0 + (x1 - x0) * frac)
@@ -407,21 +391,19 @@ class FileSource(Source):
         pygame.draw.rect(screen, INK, (px - 3, y - 4, 6, 8))
 
 
-# -------------------------------------------------------- hand synth helpers --
+# hand synth helpers
 def clip01(x):
     return max(0.0, min(1.0, x))
 
 
 def build_notes(root, degrees):
-    """All the MIDI notes of a scale across NUM_OCTAVES, plus the top root."""
     notes = [root + 12 * octave + d for octave in range(NUM_OCTAVES) for d in degrees]
     notes.append(root + 12 * NUM_OCTAVES)
     return notes
 
 
 def pick_index(height, count, current):
-    """Turn hand height (0..1) into a note index, sticking to the current
-    note until the hand moves clearly into the next one."""
+    # height -> note index, but stay on current note unless hand moves far enough
     raw = height * count
     if current is not None and abs(raw - (current + 0.5)) < 0.5 + HYSTERESIS:
         return current
@@ -438,18 +420,16 @@ def note_name(midi):
 
 
 def hand_info(landmarks):
-    """Pull the numbers we care about out of MediaPipe's 21 landmarks."""
     pts = [(lm.x, lm.y) for lm in landmarks.landmark]
-    palm_y = pts[9][1]                                    # middle-finger knuckle
+    palm_y = pts[9][1]  # middle knuckle
     height = 1 - clip01((palm_y - Y_TOP) / (Y_BOTTOM - Y_TOP))
-    hand_size = math.dist(pts[0], pts[9]) or 1e-6         # wrist -> knuckle
-    pinch = math.dist(pts[4], pts[8]) / hand_size         # thumb tip -> index tip
-    openness = clip01((pinch - 0.2) / 0.8)                # 0 = pinched, 1 = wide open
+    hand_size = math.dist(pts[0], pts[9]) or 1e-6
+    pinch = math.dist(pts[4], pts[8]) / hand_size  # thumb to index
+    openness = clip01((pinch - 0.2) / 0.8)
     return {"pts": pts, "height": height, "openness": openness}
 
 
 def draw_meter(screen, label, value, x, y, w, color=BLUE):
-    """A thin editorial slider: label, percentage, line with a square handle."""
     draw_text(screen, FONT_TINY, label, (x, y), INK)
     draw_text(screen, FONT_TINY, f"{int(value * 100):3d}%", (x + w, y), INK, "topright")
     ly = y + 26
@@ -459,30 +439,27 @@ def draw_meter(screen, label, value, x, y, w, color=BLUE):
     pygame.draw.rect(screen, INK, (end - 4, ly - 6, 8, 12))
 
 
-# ------------------------------------------------------------------ reverb --
+# reverb
 class Reverb:
-    """A big, dark, stereo reverb. The sound is convolved with a synthetic room
-    (a burst of noise that fades away over a few seconds), done in the frequency
-    domain block by block so it's fast enough to run live."""
+    # convolution reverb w/ a fake room (decaying noise). partitioned fft
+    # so it can run in realtime
 
     def __init__(self, sample_rate, block, seconds):
         self.block = block
         n = int(seconds * sample_rate)
-        self.parts = -(-n // block)                     # number of blocks in the room
+        self.parts = -(-n // block)  # ceil div
         length = self.parts * block
         self.H = []
-        for seed in (7, 11):                            # a different room for each ear
+        for seed in (7, 11):  # diff room per ear = stereo
             ir = self._make_ir(length, sample_rate, seed)
             blocks = ir.reshape(self.parts, block)
             self.H.append(np.fft.rfft(blocks, n=2 * block, axis=1).astype(np.complex64))
-        # Remembers the spectrum of the most recent input blocks.
         self.fdl = np.zeros((self.parts, block + 1), dtype=np.complex64)
         self.idx = 0
         self.prev_in = np.zeros(block, dtype=np.float32)
 
     @staticmethod
     def _make_ir(n, sr, seed):
-        """The room's 'fingerprint': noise that fades out, darker as it goes."""
         rng = np.random.default_rng(seed)
         t = np.arange(n) / sr
         seconds = n / sr
@@ -490,16 +467,16 @@ class Reverb:
         freqs = np.fft.rfftfreq(n, 1 / sr)
         dark = np.fft.irfft(np.fft.rfft(noise) / (1 + (freqs / 2500.0) ** 2), n)
         dark *= noise.std() / dark.std()
-        # Dark noise lingers for the whole tail, bright noise dies quickly.
+        # dark part lasts long, bright part dies fast
         ir = dark * np.exp(-t / (seconds / 6.9)) + 0.5 * noise * np.exp(-t / 0.12)
-        ir *= 1 - np.exp(-t / 0.02)                     # soft onset
+        ir *= 1 - np.exp(-t / 0.02)
         pre_delay = int(0.015 * sr)
         ir = np.roll(ir, pre_delay)
         ir[:pre_delay] = 0
-        return ir / np.sqrt(np.sum(ir ** 2))            # keep the loudness unchanged
+        return ir / np.sqrt(np.sum(ir ** 2))
 
     def process(self, x):
-        """Feed one block of mono audio, get back (left, right) reverb."""
+        # mono block in, (left, right) out
         frame = np.concatenate((self.prev_in, x))
         self.prev_in = x.copy()
         self.idx = (self.idx + 1) % self.parts
@@ -507,7 +484,6 @@ class Reverb:
         idx = self.idx
         outs = []
         for H in self.H:
-            # Each stored block is multiplied by the matching slice of the room.
             acc = (self.fdl[idx::-1] * H[:idx + 1]).sum(axis=0)
             if idx + 1 < self.parts:
                 acc += (self.fdl[:idx:-1] * H[idx + 1:]).sum(axis=0)
@@ -516,11 +492,8 @@ class Reverb:
         return outs[0], outs[1]
 
 
-# ----------------------------------------------------------- hand synth source --
+# hand synth
 class HandSynthSource(Source):
-    """A synthesizer you play with your hands. It makes the sound itself, and
-    the visualizer draws the spectrum of what it's producing."""
-
     name = "hand synth"
     hint = "S = SCALE     < / > = KEY     SPACE = MUTE     ESC = MENU"
     db_floor = -80
@@ -533,37 +506,37 @@ class HandSynthSource(Source):
 
     def __init__(self):
         if HAND_ERROR:
-            print("\nHand synth isn't available:", HAND_ERROR)
-            print("It needs Python 3.12 and:  py -3.12 -m pip install opencv-python mediapipe==0.10.21")
-            print("(If MediaPipe says it has no 'solutions', that's the fix.)\n")
+            print("\nhand synth not available:", HAND_ERROR)
+            print("needs python 3.12:  py -3.12 -m pip install opencv-python mediapipe==0.10.21")
+            print("(if mediapipe says no 'solutions' thats the fix)\n")
             raise RuntimeError("needs mediapipe + opencv (run with Python 3.12)")
 
-        # audio state (the audio thread reads the target_* values)
-        self.freq = 220.0            # current (smoothed) frequency
-        self.amp = 0.0               # current (smoothed) volume
+        # audio
+        self.freq = 220.0
+        self.amp = 0.0
         self.target_freq = 220.0
         self.target_amp = 0.0
-        self.brightness = 0.5        # 0 = soft and dark, 1 = bright and buzzy
-        self.reverb_mix = 0.6        # 0 = dry, 1 = all reverb
+        self.brightness = 0.5
+        self.reverb_mix = 0.6
         rng = np.random.default_rng()
-        self.phases = rng.uniform(0, 2 * np.pi, len(DETUNE_RATIOS))   # one per voice
+        self.phases = rng.uniform(0, 2 * np.pi, len(DETUNE_RATIOS))
         self.sub_phase = 0.0
         self.reverb = Reverb(self.sample_rate, AUDIO_BLOCK, REVERB_SECONDS)
-        self.history = np.zeros(BLOCK_SIZE, dtype=np.float32)   # feeds the visualizer
+        self.history = np.zeros(BLOCK_SIZE, dtype=np.float32)
         self.stream = None
 
-        # vision state
+        # camera
         self.cap = None
         self.hands = None
-        self.camera = None           # latest camera picture, as a pygame surface
-        self.wash = None             # white veil that gives the camera a high-key look
+        self.camera = None
+        self.wash = None
         self.cam_x, self.cam_y = self.panel.x, self.panel.y
         self.cam_w, self.cam_h = self.panel.w, self.panel.h
-        self.found = {}              # {'Left'/'Right': hand info}
+        self.found = {}
 
-        # musical state
+        # music
         self.scale_i = 0
-        self.root = 48               # C3
+        self.root = 48  # C3
         self.note_idx = None
         self.muted = False
         self.vals = {"pitch": 0.5, "vol": 0.6, "bright": 0.5, "verb": 0.55}
@@ -571,49 +544,43 @@ class HandSynthSource(Source):
         self.midi = 48
         self.playing = False
 
-    # ---- audio ----------------------------------------------------------
     def _callback(self, outdata, frames, time_info, status):
-        if frames != AUDIO_BLOCK:            # the reverb needs fixed-size blocks
+        if frames != AUDIO_BLOCK:  # reverb needs fixed size
             outdata.fill(0)
             return
         sr = self.sample_rate
 
-        # Glide toward the targets a little each block so changes never click.
+        # glide so it doesnt click
         f_end = self.freq * (self.target_freq / self.freq) ** GLIDE
         freq = np.linspace(self.freq, f_end, frames)
         self.freq = f_end
 
-        # Slow swell in, slower fade out: this is what makes it feel like a pad.
         rate = ATTACK if self.target_amp > self.amp else RELEASE
         a_end = self.amp + (self.target_amp - self.amp) * rate
         amp = np.linspace(self.amp, a_end, frames)
         self.amp = a_end
 
-        # Five slightly detuned voices. Accumulating phase keeps each wave
-        # continuous when the pitch changes.
         inc = 2 * np.pi * DETUNE_RATIOS[:, None] * freq[None, :] / sr
-        phase = self.phases[:, None] + np.cumsum(inc, axis=1)          # (voices, frames)
+        phase = self.phases[:, None] + np.cumsum(inc, axis=1)  # (voices, frames)
         self.phases = phase[:, -1] % (2 * np.pi)
 
-        # Brightness = how quickly the overtones fade out (like a low-pass filter).
-        # Overtones that would go past the speaker's limit are switched off.
+        # brightness = how fast harmonics drop off. cut ones above nyquist
         w = HARMONICS ** (-(1.0 + 3.0 * (1.0 - self.brightness)))
         n_ok = max(1, int(0.45 * sr / (freq.max() * DETUNE_RATIOS.max())))
         w[n_ok:] = 0.0
         rms = math.sqrt(np.sum(w ** 2) / 2)
 
-        harm = np.sin(HARMONICS[None, :, None] * phase[:, None, :])    # (voices, harmonics, frames)
+        harm = np.sin(HARMONICS[None, :, None] * phase[:, None, :])
         wave = (w @ harm.sum(axis=0)) / (rms * math.sqrt(len(DETUNE_RATIOS)))
 
-        # A deep sine one octave down for weight.
+        # sub octave
         sub_phase = self.sub_phase + np.cumsum(2 * np.pi * (freq * 0.5) / sr)
         self.sub_phase = sub_phase[-1] % (2 * np.pi)
         wave = wave + SUB_LEVEL * 1.4 * np.sin(sub_phase)
 
         dry = (wave * amp * MASTER_VOLUME).astype(np.float32)
 
-        # The reverb keeps running even when the note is silent, so the tail
-        # rings out after you take your hand away.
+        # keep reverb running so tail rings out
         wet_l, wet_r = self.reverb.process(dry)
         m = self.reverb_mix
         left = (1 - m) * dry + m * wet_l
@@ -655,10 +622,8 @@ class HandSynthSource(Source):
     def get_segment(self):
         return self.history
 
-    # ---- vision ---------------------------------------------------------
     def _track(self, frame):
-        """Find the hands in a camera frame. Also builds the picture to show."""
-        frame = cv2.flip(frame, 1)                        # mirror, like a selfie
+        frame = cv2.flip(frame, 1)  # mirror
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         results = self.hands.process(rgb)
@@ -667,10 +632,10 @@ class HandSynthSource(Source):
         if results.multi_hand_landmarks:
             for lms, handed in zip(results.multi_hand_landmarks,
                                    results.multi_handedness):
-                label = handed.classification[0].label    # "Left" or "Right"
+                label = handed.classification[0].label
                 found[label] = hand_info(lms)
 
-        # Fit the picture inside the panel, keeping its shape.
+        # fit camera in panel
         h, w = rgb.shape[:2]
         scale = min(self.panel.w / w, self.panel.h / h)
         self.cam_w, self.cam_h = int(w * scale), int(h * scale)
@@ -685,7 +650,6 @@ class HandSynthSource(Source):
             self.wash.set_alpha(95)
         return found
 
-    # ---- per-frame update -------------------------------------------------
     def update(self):
         ok, frame = self.cap.read()
         if ok:
@@ -697,7 +661,6 @@ class HandSynthSource(Source):
         right, left = self.found.get("Right"), self.found.get("Left")
         vals = self.vals
 
-        # Hands -> synth controls (smoothed to remove jitter).
         targets = {
             "pitch": right["height"] if right else vals["pitch"],
             "bright": right["openness"] if right else vals["bright"],
@@ -705,10 +668,10 @@ class HandSynthSource(Source):
             "verb": left["openness"] if left else 0.55,
         }
         for key, target in targets.items():
-            vals[key] += (target - vals[key]) * 0.35
+            vals[key] += (target - vals[key]) * 0.35  # smoothing
 
         degrees = SCALES[list(SCALES)[self.scale_i]]
-        if degrees is None:                               # free glide
+        if degrees is None:
             self.midi = self.root + vals["pitch"] * 12 * NUM_OCTAVES
             self.notes = []
             self.note_idx = None
@@ -738,7 +701,6 @@ class HandSynthSource(Source):
             self.root = max(36, self.root - 1)
             self.note_idx = None
 
-    # ---- drawing ----------------------------------------------------------
     def draw_background(self, screen, panel):
         if self.camera is not None:
             screen.blit(self.camera, (self.cam_x, self.cam_y))
@@ -750,16 +712,16 @@ class HandSynthSource(Source):
               for x, y in pts]
         for a, b in mp_hands.HAND_CONNECTIONS:
             pygame.draw.line(screen, color, px[a], px[b], 2)
-        for i, p in enumerate(px):                        # hollow joints, like line art
-            r = 5 if i in (4, 8, 12, 16, 20) else 3
+        for i, p in enumerate(px):
+            r = 5 if i in (4, 8, 12, 16, 20) else 3  # fingertips bigger
             pygame.draw.circle(screen, PAPER, p, r)
             pygame.draw.circle(screen, color, p, r, 2)
-        pygame.draw.line(screen, RED, px[4], px[8], 3)    # the pinch
+        pygame.draw.line(screen, RED, px[4], px[8], 3)
         tag = "R / PITCH + BRIGHTNESS" if label == "Right" else "L / VOLUME + REVERB"
         draw_label(screen, FONT_TINY, tag, (px[0][0], px[0][1] + 14), color, PAPER, "midtop")
 
     def _draw_ladder(self, screen, panel):
-        """Note markers along the right edge so you can see where each note lives."""
+        # note lines on the right side
         count = len(self.notes)
         x0 = panel.right - 74
         for i in range(count):
@@ -779,7 +741,6 @@ class HandSynthSource(Source):
             self._draw_ladder(screen, panel)
 
         playing = self.playing
-        # big note name, left column
         note = (note_name(self.midi) + ".") if playing else "--."
         draw_text(screen, FONT_HUGE, note, (34, 96), INK if playing else GREY)
         freq_text = f"{midi_to_freq(self.midi):7.1f} HZ" if playing else "SILENT"
@@ -805,13 +766,13 @@ class HandSynthSource(Source):
                        WHITE, RED, "midtop", pad=14)
 
 
-# ----------------------------------------------------------------- drawing --
-SEG_H, SEG_GAP = 7, 3           # one bar is a stack of little blocks
+# drawing bars
+SEG_H, SEG_GAP = 7, 3
 _STEP = SEG_H + SEG_GAP
 
 
 def get_bar_sprite(bar_w, max_segments):
-    """A full-height stack of blocks, drawn once and cut down to size per bar."""
+    # draw a full bar once and just crop it each frame (faster)
     key = ("bar", bar_w, max_segments)
     if key not in _cache:
         h = max_segments * _STEP
@@ -823,7 +784,6 @@ def get_bar_sprite(bar_w, max_segments):
 
 
 def draw_bars(screen, smoothed, peaks, area, max_frac=0.92):
-    """Segmented black bars with a blue top block and a red peak marker."""
     slot = area.w / NUM_BARS
     bar_w = max(3, int(slot * 0.58))
     max_segments = max(1, int(area.h * max_frac / _STEP))
@@ -843,7 +803,6 @@ def draw_bars(screen, smoothed, peaks, area, max_frac=0.92):
 
 
 def draw_axis(screen, area):
-    """Baseline with a tick per band and frequency markers underneath."""
     slot = area.w / NUM_BARS
     pygame.draw.line(screen, INK, (area.left, area.bottom + 3), (area.right, area.bottom + 3), 1)
     for i in range(NUM_BARS):
@@ -857,7 +816,6 @@ def draw_axis(screen, area):
 
 
 def draw_glitch(screen, panel, smoothed):
-    """Little blue rectangles in the corner that twitch with the music."""
     for k in range(7):
         level = float(smoothed[(k * 6) % NUM_BARS])
         y = panel.top + 40 + k * 11
@@ -866,9 +824,9 @@ def draw_glitch(screen, panel, smoothed):
         pygame.draw.rect(screen, WHITE, (panel.left + 18 + width + 6, y, 10 + (k * 7) % 22, 4))
 
 
-# -------------------------------------------------------------------- menu --
+# menu
 def pick_file():
-    """Open a file dialog. Returns '' if the user cancels."""
+    # returns '' if cancelled
     import tkinter as tk
     from tkinter import filedialog
 
@@ -884,7 +842,6 @@ def pick_file():
 
 
 def draw_flow_lines(screen, panel, t, energy):
-    """Thin animated line art across the menu's sky panel."""
     screen.set_clip(panel)
     xs = range(panel.left, panel.right + 8, 8)
     for k in range(9):
@@ -900,7 +857,7 @@ def draw_flow_lines(screen, panel, t, energy):
 
 
 def run_menu(screen, clock, message=""):
-    """Show the start menu. Returns 'mic', 'file', 'hand', 'rhythm', or None (quit)."""
+    # returns 'mic' 'file' 'hand' 'rhythm' or None
     hand_desc = ("a reverb pad played with your hands" if not HAND_ERROR
                  else "needs python 3.12 + mediapipe")
     rows = [
@@ -939,14 +896,12 @@ def run_menu(screen, clock, message=""):
                     ["SYS / AV-04", "4 MODES", f"{NUM_BARS} BANDS / LOG SCALE"],
                     "1 / 2 / 3 / 4 = SELECT     ESC = QUIT", f"{clock.get_fps():.0f} FPS")
 
-        # sky panel with flowing line art
         draw_panel(screen, MENU_PANEL)
         draw_flow_lines(screen, MENU_PANEL, t, 0.6 if hovered is not None else 0.0)
         draw_label(screen, FONT_TINY, "SIGNAL / 4 MODES", (MENU_PANEL.left + 16, MENU_PANEL.top + 14))
         for i, line in enumerate(("every frequency,", "turned into light.")):
             draw_label(screen, FONT_TINY, line, (MENU_PANEL.left + 16, MENU_PANEL.bottom - 52 + i * 22))
 
-        # the three options
         for i, ((num, label, desc, _), rect) in enumerate(zip(rows, rects)):
             hot = i == hovered
             if hot:
@@ -970,27 +925,32 @@ def run_menu(screen, clock, message=""):
         clock.tick(FPS)
 
 
-# ---------------------------------------------------------- rhythm charting --
-# Turns a song into a playable chart: finds the moments where something
-# "happens" in the music (drum hits, plucks, chord stabs), then picks which of
-# them become notes, and in which lane, for each difficulty.
+# rhythm game charting
+# find onsets (drums, plucks etc) then pick which ones become notes per difficulty
 
 LANES = 4
 LANE_KEYS = (pygame.K_d, pygame.K_f, pygame.K_j, pygame.K_k)
 LANE_LABELS = ("D", "F", "J", "K")
+# gap = min time between notes, keep = % of strongest hits used, source = normal/dense onsets
+# chords/triples = how often extra keys, hold_* = long note stuff, lane_gap = min gap in same lane
+# window = timing window multiplier
 DIFFICULTIES = {
-    # gap = shortest time between notes, keep = share of the strongest hits used,
-    # hold_min = shortest long note (seconds), hold_share = most notes that may be long
-    "easy":   {"gap": 0.42, "keep": 0.40, "doubles": 0.00, "hold_min": 0.60, "hold_share": 0.30},
-    "normal": {"gap": 0.26, "keep": 0.70, "doubles": 0.00, "hold_min": 0.50, "hold_share": 0.22},
-    "hard":   {"gap": 0.15, "keep": 0.95, "doubles": 0.12, "hold_min": 0.42, "hold_share": 0.18},
+    "easy":   {"gap": 0.42,  "keep": 0.40, "source": "normal", "chords": 0.00, "triples": 0.00,
+               "hold_min": 0.55, "hold_share": 0.35, "max_holds": 1, "tail_gap": 0.30, "lane_gap": 0.42, "window": 1.15},
+    "normal": {"gap": 0.26,  "keep": 0.70, "source": "normal", "chords": 0.00, "triples": 0.00,
+               "hold_min": 0.45, "hold_share": 0.30, "max_holds": 2, "tail_gap": 0.28, "lane_gap": 0.30, "window": 1.00},
+    "hard":   {"gap": 0.15,  "keep": 0.95, "source": "normal", "chords": 0.14, "triples": 0.00,
+               "hold_min": 0.38, "hold_share": 0.30, "max_holds": 2, "tail_gap": 0.22, "lane_gap": 0.22, "window": 0.90},
+    "expert": {"gap": 0.11,  "keep": 1.00, "source": "dense",  "chords": 0.24, "triples": 0.00,
+               "hold_min": 0.32, "hold_share": 0.36, "max_holds": 2, "tail_gap": 0.16, "lane_gap": 0.17, "window": 0.80},
+    "insane": {"gap": 0.085, "keep": 1.00, "source": "dense",  "chords": 0.32, "triples": 0.25,
+               "hold_min": 0.28, "hold_share": 0.42, "max_holds": 3, "tail_gap": 0.12, "lane_gap": 0.14, "window": 0.70},
 }
-MAX_HOLD = 2.4               # longest a long note can be (seconds)
-ONSET_BIAS = 0.003           # seconds added to detected hit times (measured on test clicks)
+MAX_HOLD = 2.4
+ONSET_BIAS = 0.003  # tested w/ clicks
 
 
 def stft_mag(x, n_fft, hop):
-    """Short-time Fourier transform magnitudes, shape (frames, n_fft/2 + 1)."""
     x = np.asarray(x, dtype=np.float32)
     if len(x) < n_fft:
         x = np.pad(x, (0, n_fft - len(x)))
@@ -999,14 +959,14 @@ def stft_mag(x, n_fft, hop):
     out = np.empty((frames, n_fft // 2 + 1), dtype=np.float32)
     starts = hop * np.arange(frames)
     offsets = np.arange(n_fft)
-    for s in range(0, frames, 256):              # in batches, to keep memory small
+    for s in range(0, frames, 256):  # batches so memory doesnt blow up
         e = min(frames, s + 256)
         out[s:e] = np.abs(np.fft.rfft(x[starts[s:e, None] + offsets[None, :]] * win, axis=1))
     return out
 
 
 def estimate_tempo(env, fr):
-    """Tempo from how the hits repeat (autocorrelation), just for display."""
+    # autocorrelation, only used for display
     n = len(env)
     if n < fr * 6 or env.max() <= 0:
         return 100.0
@@ -1020,66 +980,74 @@ def estimate_tempo(env, fr):
 
 
 def measure_sustain(level, flux, i, fr, max_len=3.0):
-    """How long the sound that started at frame i keeps going: until it fades
-    to a fraction of its peak, or until something new hits in the same band."""
+    # how long does the note at frame i last (until it fades or a new hit)
     peak = level[i:i + 8].max()
-    onset_flux = flux[max(0, i - 1):i + 4].max()   # how sharp this note's own attack was
+    onset_flux = flux[max(0, i - 1):i + 4].max()
     if peak <= 0 or onset_flux <= 0:
         return 0.0
     end = min(len(level), i + int(max_len * fr))
     j, quiet = i + 4, 0
     while j < end:
-        if flux[j] > 0.35 * onset_flux:         # a fresh attack: the old note is over
+        if flux[j] > 0.5 * onset_flux:  # new attack
             break
-        quiet = quiet + 1 if level[j] < 0.4 * peak else 0
-        if quiet >= 3:                          # faded away
+        quiet = quiet + 1 if level[j] < 0.3 * peak else 0
+        if quiet >= 3:
             j -= 2
             break
         j += 1
     return (j - i) / fr
 
 
-def detect_onsets(x, sr):
-    """Find the moments where new sound starts. Returns (onsets, envelope, frames_per_second)."""
+def onset_curves(x, sr):
     n_fft, hop = 512, 256
     mag = stft_mag(x, n_fft, hop)
-    fr = sr / hop
     freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
-    logm = np.log1p(30.0 * mag)                                        # loudness-like scale
-    flux = np.maximum(0.0, np.diff(logm, axis=0, prepend=logm[:1]))    # only sound getting louder
-    bands = [(40, 150), (150, 500), (500, 2200), (2200, 9000)]         # kick / low / mid / hats
+    logm = np.log1p(30.0 * mag)
+    flux = np.maximum(0.0, np.diff(logm, axis=0, prepend=logm[:1]))  # only increases
+    bands = [(40, 150), (150, 500), (500, 2200), (2200, 9000)]  # kick, low, mid, hats
     band_flux = np.stack([flux[:, (freqs >= lo) & (freqs < hi)].sum(axis=1)
                           for lo, hi in bands], axis=1)
     level = np.stack([mag[:, (freqs >= lo) & (freqs < hi)].sum(axis=1)
-                      for lo, hi in bands], axis=1)                    # how loud each band is
-    norm = band_flux / (np.percentile(band_flux, 95, axis=0) + 1e-9)   # each band on its own scale
+                      for lo, hi in bands], axis=1)
+    norm = band_flux / (np.percentile(band_flux, 95, axis=0) + 1e-9)
     env = np.convolve((norm * np.array([1.0, 1.0, 0.8, 0.6])).sum(axis=1),
                       [0.25, 0.5, 0.25], mode="same")
+    fr = sr / hop
     win = max(3, int(0.5 * fr))
-    local = np.convolve(env, np.ones(win) / win, mode="same")          # what's "normal" nearby
-    threshold = local * 1.3 + 0.3
+    local = np.convolve(env, np.ones(win) / win, mode="same")
+    return {"env": env, "local": local, "norm": norm, "band_flux": band_flux,
+            "level": level, "fr": fr, "sr": sr, "hop": hop, "n_fft": n_fft}
+
+
+def pick_onsets(c, scale=1.3, offset=0.3):
+    # lower scale/offset = catches quieter hits too
+    env, local, norm = c["env"], c["local"], c["norm"]
+    threshold = local * scale + offset
     peaks = np.where((env[1:-1] >= env[:-2]) & (env[1:-1] > env[2:])
                      & (env[1:-1] > threshold[1:-1]))[0] + 1
     onsets = []
     for i in peaks:
-        onsets.append({"t": (i * hop + n_fft / 2) / sr + ONSET_BIAS,
+        onsets.append({"t": (i * c["hop"] + c["n_fft"] / 2) / c["sr"] + ONSET_BIAS,
                        "strength": float(env[i] - local[i]),
                        "bands": norm[max(0, i - 1):i + 2].max(axis=0)})
-    if onsets:                                                          # spread the lanes evenly
+    if onsets:
         mean_bands = np.mean([o["bands"] for o in onsets], axis=0) + 1e-9
         for o, i in zip(onsets, peaks):
             o["rel"] = o["bands"] / mean_bands
-            k = int(np.argmax(o["rel"]))                                # the band this hit lives in
-            o["sustain"] = measure_sustain(level[:, k], band_flux[:, k], int(i), fr)
-    return onsets, env, fr
+            k = int(np.argmax(o["rel"]))
+            o["sustain"] = measure_sustain(c["level"][:, k], c["band_flux"][:, k], int(i), c["fr"])
+    return onsets
+
+
+def detect_onsets(x, sr):
+    c = onset_curves(x, sr)
+    return pick_onsets(c), c["env"], c["fr"]
 
 
 def build_chart(onsets, difficulty, duration, seed):
-    """Pick the notes for one difficulty: strongest hits first, spaced by the
-    difficulty's minimum gap, each put in the lane that matches its sound."""
     cfg = DIFFICULTIES[difficulty]
     order = sorted(range(len(onsets)), key=lambda i: -onsets[i]["strength"])
-    taken = []                                                          # sorted times
+    taken = []
     chosen = []
     for i in order[: int(len(order) * cfg["keep"])]:
         t = onsets[i]["t"]
@@ -1094,38 +1062,56 @@ def build_chart(onsets, difficulty, duration, seed):
         chosen.append(i)
     chosen.sort(key=lambda i: onsets[i]["t"])
 
+    # long notes = longest sustains
+    long_len = {}
+    candidates = sorted((i for i in chosen if onsets[i]["sustain"] >= cfg["hold_min"] + 0.05),
+                        key=lambda i: -onsets[i]["sustain"])
+    for i in candidates[: int(len(chosen) * cfg["hold_share"])]:
+        long_len[i] = min(onsets[i]["sustain"] - 0.05, MAX_HOLD, duration - 0.3 - onsets[i]["t"])
+
     rng = random.Random(seed)
-    top = np.percentile([onsets[i]["strength"] for i in chosen], 88) if chosen else 0
-    notes, last_lane, run, last_t = [], -1, 0, -9.0
-    recent = []                                                         # the last few lanes used
+    strengths = [onsets[i]["strength"] for i in chosen]
+    chord_cut = (np.percentile(strengths, 100 * (1 - cfg["chords"]))
+                 if strengths and cfg["chords"] else float("inf"))
+
+    busy_until = [-1.0] * LANES
+    hold_end = [-1.0] * LANES
+    lane_last = [-9.0] * LANES
+    notes, last_lane, run, last_t, recent = [], -1, 0, -9.0, []
     for i in chosen:
         o = onsets[i]
-        # a note goes where its sound points, but lanes used a lot lately are less attractive
-        balanced = [o["rel"][k] / (1 + 0.6 * recent.count(k)) for k in range(LANES)]
-        prefs = [int(b) for b in np.argsort(-np.array(balanced))]
+        t = o["t"]
+        free = [k for k in range(LANES)
+                if busy_until[k] <= t and t - lane_last[k] >= cfg["lane_gap"]]
+        if not free:
+            continue
+        # pick lane by sound but penalize lanes used a lot recently
+        balanced = np.array([o["rel"][k] / (1 + 0.6 * recent.count(k)) if k in free else -1.0
+                             for k in range(LANES)])
+        prefs = [int(k) for k in np.argsort(-balanced) if k in free]
         lane = prefs[0]
-        if lane == last_lane and (o["t"] - last_t < 0.35 or run >= 2):
-            lane = prefs[1]                                             # don't hammer one lane
+        if lane == last_lane and len(prefs) > 1 and (t - last_t < 0.35 or run >= 2):
+            lane = prefs[1]  # no jacks
         run = run + 1 if lane == last_lane else 0
         recent = (recent + [lane])[-6:]
-        notes.append({"t": float(o["t"]), "lane": lane, "len": 0.0, "_s": o.get("sustain", 0.0)})
-        if cfg["doubles"] and o["strength"] >= top and rng.random() < cfg["doubles"] * 4:
-            notes.append({"t": float(o["t"]), "lane": (lane + 2) % LANES, "len": 0.0, "_s": 0.0})
-        last_lane, last_t = lane, o["t"]
 
-    # Long notes: the hits whose sound lasts longest, up to this difficulty's share.
-    candidates = sorted((n for n in notes if n["_s"] >= cfg["hold_min"] + 0.1),
-                        key=lambda n: -n["_s"])
-    for n in candidates[: int(len(notes) * cfg["hold_share"])]:
-        n["len"] = min(n["_s"] - 0.1, MAX_HOLD, duration - 0.3 - n["t"])
-    for lane in range(LANES):                                           # nothing may overlap a long note
-        in_lane = sorted((n for n in notes if n["lane"] == lane), key=lambda n: n["t"])
-        for a, b in zip(in_lane, in_lane[1:]):
-            if a["len"] > 0:
-                a["len"] = min(a["len"], b["t"] - a["t"] - 0.30)
-    for n in notes:
-        n["len"] = round(n["len"], 3) if n["len"] >= cfg["hold_min"] else 0.0
-        del n["_s"]
+        length = long_len.get(i, 0.0)
+        if length and sum(1 for k in range(LANES) if hold_end[k] > t) >= cfg["max_holds"]:
+            length = 0.0
+        if length:
+            busy_until[lane] = t + length + cfg["tail_gap"]
+            hold_end[lane] = t + length
+        lane_last[lane] = t
+        notes.append({"t": float(t), "lane": lane, "len": round(float(length), 3)})
+
+        if o["strength"] >= chord_cut:  # chords
+            extra = 2 if (cfg["triples"] and rng.random() < cfg["triples"]) else 1
+            others = [k for k in prefs if k != lane]
+            rng.shuffle(others)
+            for k in others[:extra]:
+                lane_last[k] = t
+                notes.append({"t": float(t), "lane": k, "len": 0.0})
+        last_lane, last_t = lane, t
     return notes
 
 
@@ -1138,7 +1124,6 @@ def to_stereo(data):
 
 
 def analyze_rhythm(path, report=None):
-    """Read a song and build its charts. Returns a dict for the game."""
     def say(frac, text):
         if report:
             report(frac, text)
@@ -1149,7 +1134,7 @@ def analyze_rhythm(path, report=None):
     if duration < 10:
         raise ValueError("that song is too short (it needs at least 10 seconds)")
     mono = data.mean(axis=1)
-    factor = max(1, int(round(sr / 22050)))                             # analyse at ~22 kHz: faster
+    factor = max(1, int(round(sr / 22050)))  # downsample to ~22k, faster
     if factor > 1:
         usable = (len(mono) // factor) * factor
         analysis = mono[:usable].reshape(-1, factor).mean(axis=1)
@@ -1158,20 +1143,24 @@ def analyze_rhythm(path, report=None):
     sra = sr / factor
 
     say(0.15, "listening for hits")
-    onsets, env, fr = detect_onsets(analysis, sra)
+    curves = onset_curves(analysis, sra)
+    env, fr = curves["env"], curves["fr"]
+    onsets = pick_onsets(curves)
     if len(onsets) < 20:
         raise ValueError("couldn't find enough beats in that song to build a chart")
+    dense = pick_onsets(curves, 1.12, 0.12)
 
     say(0.7, "finding the tempo")
     bpm = estimate_tempo(env, fr)
 
     say(0.8, "building the charts")
     seed = len(data) % 100003
-    charts = {d: build_chart(onsets, d, duration, seed) for d in DIFFICULTIES}
+    charts = {d: build_chart(dense if cfg["source"] == "dense" else onsets, d, duration, seed)
+              for d, cfg in DIFFICULTIES.items()}
     density = {}
     for d, notes in charts.items():
         counts, _ = np.histogram([n["t"] for n in notes], bins=60, range=(0, duration))
-        density[d] = [float(c) / (duration / 60.0) for c in counts]     # notes per second
+        density[d] = [float(c) / (duration / 60.0) for c in counts]
 
     say(1.0, "done")
     return {"name": os.path.splitext(os.path.basename(path))[0], "duration": duration,
@@ -1179,20 +1168,23 @@ def analyze_rhythm(path, report=None):
             "hits_found": len(onsets), "charts": charts, "density": density}
 
 
-# ------------------------------------------------------------- rhythm game --
-LEAD_IN_SECONDS = 3.0                 # countdown before the song starts
-WINDOW_PERFECT, WINDOW_GREAT, WINDOW_OK = 0.045, 0.090, 0.135   # seconds either side of a note
-HOLD_AUTO = 0.05                       # holding until this close to the tail completes it
-HOLD_TAIL_WINDOW = 0.15                # letting go this close to the tail still counts
-HOLD_POINTS_PER_SECOND = 220           # bonus for every second a long note is held
+# rhythm game
+LEAD_IN_SECONDS = 3.0
+WINDOW_PERFECT, WINDOW_GREAT, WINDOW_OK = 0.045, 0.090, 0.135
+HOLD_AUTO = 0.05
+HOLD_TAIL_WINDOW = 0.15
+HOLD_POINTS_PER_SECOND = 220
+LIFE_MISS = {"easy": 4.0, "normal": 6.0, "hard": 8.0, "expert": 10.0, "insane": 12.0}
+LIFE_GAIN = {"perfect": 0.8, "great": 0.4, "ok": 0.0, "miss": 0.0}
+FAIL_ON = ("expert", "insane")
 POINTS = {"perfect": 300, "great": 200, "ok": 100, "miss": 0}
 ACCURACY_WEIGHT = {"perfect": 1.0, "great": 0.75, "ok": 0.4, "miss": 0.0}
 JUDGE_COLOR = {"perfect": BLUE, "great": INK, "ok": GREY, "miss": RED}
-FIELD = pygame.Rect(380, 96, 360, 504)                          # the playfield panel
+FIELD = pygame.Rect(380, 96, 360, 504)
 LANE_W, LANE_GAP = 84, 4
-HIT_Y = FIELD.bottom - 96                                       # where notes should be hit
-GAME_FPS = 120                                                  # higher = tighter timing
-RHYTHM = {"offset": 0.0, "speed": 560.0}                        # kept between songs
+HIT_Y = FIELD.bottom - 96
+GAME_FPS = 120
+RHYTHM = {"offset": 0.0, "speed": 560.0}  # saved between songs
 
 
 def lane_x(lane):
@@ -1207,8 +1199,6 @@ def grade_for(accuracy):
 
 
 class RhythmGame:
-    """One play-through: plays the song, keeps the clock, judges your key presses."""
-
     def __init__(self, song, difficulty):
         self.song = song
         self.data = song["stereo"]
@@ -1221,20 +1211,27 @@ class RhythmGame:
         for lane_notes in self.lanes:
             lane_notes.sort(key=lambda n: n["t"])
         self.lane_times = [[n["t"] for n in lane_notes] for lane_notes in self.lanes]
-        self.ptr = [0] * LANES                       # first note in each lane not yet judged
-        self.down = [False] * LANES                  # which keys are held right now
-        self.active = [None] * LANES                 # the long note being held in each lane
+        self.ptr = [0] * LANES  # next unjudged note per lane
+        self.down = [False] * LANES
+        self.active = [None] * LANES  # held long note per lane
         self.holds_total = sum(1 for n in self.notes if n["len"] > 0)
         self.holds_done = 0
-        self.total_judgments = len(self.notes) + self.holds_total    # a long note is judged twice
+        self.total_judgments = len(self.notes) + self.holds_total  # long notes count twice
         self._tick_t = None
         self._tick_carry = 0.0
 
-        self.offset = RHYTHM["offset"]               # shifts the notes against the music
-        self.speed = RHYTHM["speed"]                 # how fast notes fall (pixels per second)
+        scale = DIFFICULTIES[difficulty]["window"]
+        self.w_perfect = WINDOW_PERFECT * scale
+        self.w_great = WINDOW_GREAT * scale
+        self.w_ok = WINDOW_OK * scale
+        self.w_tail = HOLD_TAIL_WINDOW * scale
+        self.life = 100.0
+        self.failed = False
 
-        # the song clock: position in the audio, plus how far we are into the current block
-        self.pos = -int(LEAD_IN_SECONDS * self.sr)   # negative = countdown
+        self.offset = RHYTHM["offset"]
+        self.speed = RHYTHM["speed"]
+
+        self.pos = -int(LEAD_IN_SECONDS * self.sr)  # negative during countdown
         self.paused = False
         self.frozen = None
         self.finished = False
@@ -1248,11 +1245,10 @@ class RhythmGame:
         self.combo = 0
         self.max_combo = 0
         self.counts = {"perfect": 0, "great": 0, "ok": 0, "miss": 0}
-        self.errors = []                             # how early/late each hit was (seconds)
-        self.judgement = None                        # (name, wall time, error) for the popup
-        self.flash = [0.0] * LANES                   # when each lane last got hit
+        self.errors = []
+        self.judgement = None
+        self.flash = [0.0] * LANES
 
-    # ---- audio ----------------------------------------------------------
     def _callback(self, outdata, frames, time_info, status):
         outdata.fill(0)
         start = self.pos
@@ -1262,7 +1258,7 @@ class RhythmGame:
                 outdata[lo - start:hi - start] = self.data[lo:hi]
             self.pos = start + frames
         self._cb_pos, self._cb_wall = start, time.perf_counter()
-        try:                                         # how long until this block is heard
+        try:
             lat = time_info.outputBufferDacTime - time_info.currentTime
         except Exception:
             lat = 0.0
@@ -1292,24 +1288,26 @@ class RhythmGame:
             self.frozen = None
         self.paused = paused
 
-    # ---- the clock ------------------------------------------------------
     def raw_time(self):
-        """Where the music is right now, in seconds (what you're hearing)."""
+        # current song time in seconds (what you hear)
         if self.paused and self.frozen is not None:
             return self.frozen
         t = self._cb_pos / self.sr + (time.perf_counter() - self._cb_wall) - self.latency
-        self._last_t = max(self._last_t, t)          # never runs backwards
+        self._last_t = max(self._last_t, t)  # dont go backwards
         return self._last_t
 
     def now(self):
         return self.raw_time() + self.offset
 
-    # ---- judging --------------------------------------------------------
     def _register(self, name, error=None, label=None):
         self.counts[name] += 1
         if name == "miss":
             self.combo = 0
+            self.life = max(0.0, self.life - LIFE_MISS[self.difficulty])
+            if self.life <= 0 and self.difficulty in FAIL_ON:
+                self.failed = True
         else:
+            self.life = min(100.0, self.life + LIFE_GAIN[name])
             self.score += int(POINTS[name] * (1 + min(self.combo, 40) * 0.05))
             self.combo += 1
             self.max_combo = max(self.max_combo, self.combo)
@@ -1318,10 +1316,9 @@ class RhythmGame:
         self.judgement = (name, time.perf_counter(), error, label)
 
     def _miss_note(self, note):
-        """A note nobody played. A long note counts as two misses: head and tail."""
         note["state"] = "miss"
         self._register("miss")
-        if note["len"] > 0:
+        if note["len"] > 0:  # head + tail
             self._register("miss")
 
     def _finish_hold(self, lane, name):
@@ -1339,25 +1336,24 @@ class RhythmGame:
         self._register("miss", label="DROPPED")
 
     def press(self, lane, t=None):
-        """A key went down. Hit the nearest note in that lane if it's close enough."""
         t = self.now() if t is None else t
         self.down[lane] = True
         if self.active[lane]:
-            return                                   # already holding something in this lane
+            return
         notes, i = self.lanes[lane], self.ptr[lane]
         while i < len(notes):
             note = notes[i]
-            error = t - note["t"]                    # positive = late
-            if error < -WINDOW_OK:
-                break                                # too early: ignore the press
+            error = t - note["t"]  # + = late
+            if error < -self.w_ok:
+                break  # too early
             i += 1
-            if error > WINDOW_OK:                    # this note was missed already
+            if error > self.w_ok:
                 self._miss_note(note)
                 continue
-            name = ("perfect" if abs(error) <= WINDOW_PERFECT
-                    else "great" if abs(error) <= WINDOW_GREAT else "ok")
+            name = ("perfect" if abs(error) <= self.w_perfect
+                    else "great" if abs(error) <= self.w_great else "ok")
             if note["len"] > 0:
-                note["state"] = "holding"            # now keep the key down until the tail
+                note["state"] = "holding"
                 self.active[lane] = note
             else:
                 note["state"] = name
@@ -1367,7 +1363,6 @@ class RhythmGame:
         self.ptr[lane] = i
 
     def release(self, lane, t=None):
-        """A key came up. If it was holding a long note, did it last long enough?"""
         t = self.now() if t is None else t
         self.down[lane] = False
         note = self.active[lane]
@@ -1376,17 +1371,17 @@ class RhythmGame:
         remaining = note["end"] - t
         if remaining <= HOLD_AUTO:
             self._finish_hold(lane, "perfect")
-        elif remaining <= HOLD_TAIL_WINDOW:
+        elif remaining <= self.w_tail:
             self._finish_hold(lane, "great")
         else:
-            self._drop_hold(lane)                    # let go too early
+            self._drop_hold(lane)
 
     def update(self):
-        """Unplayed notes that slid past the hit line become misses; long notes tick along."""
         t = self.now()
+        # notes that went past = miss
         for lane in range(LANES):
             notes, i = self.lanes[lane], self.ptr[lane]
-            while i < len(notes) and notes[i]["t"] < t - WINDOW_OK:
+            while i < len(notes) and notes[i]["t"] < t - self.w_ok:
                 self._miss_note(notes[i])
                 i += 1
             self.ptr[lane] = i
@@ -1397,7 +1392,7 @@ class RhythmGame:
             note = self.active[lane]
             if not note:
                 continue
-            if t >= note["end"] - HOLD_AUTO:         # made it to the end of the tail
+            if t >= note["end"] - HOLD_AUTO:
                 if self.down[lane]:
                     self._finish_hold(lane, "perfect")
                 else:
@@ -1408,8 +1403,10 @@ class RhythmGame:
         self.score += whole
         self._tick_carry -= whole
 
+        if self.failed:
+            self.finished = True
         if self.pos >= len(self.data) + int(0.8 * self.sr):
-            for lane in range(LANES):                # the song ended while a key was down
+            for lane in range(LANES):
                 if self.active[lane]:
                     if self.down[lane]:
                         self._finish_hold(lane, "perfect")
@@ -1417,7 +1414,6 @@ class RhythmGame:
                         self._drop_hold(lane)
             self.finished = True
 
-    # ---- results --------------------------------------------------------
     def accuracy(self, judged_only=False):
         judged = sum(self.counts.values()) if judged_only else self.total_judgments
         if judged == 0:
@@ -1425,24 +1421,23 @@ class RhythmGame:
         return sum(ACCURACY_WEIGHT[k] * v for k, v in self.counts.items()) / judged
 
     def result(self):
-        acc = self.accuracy()
+        acc = self.accuracy(True) if self.failed else self.accuracy()
         return {"score": self.score, "max_combo": self.max_combo, "counts": dict(self.counts),
-                "accuracy": acc, "grade": grade_for(acc), "errors": list(self.errors),
+                "accuracy": acc, "grade": "F" if self.failed else grade_for(acc),
+                "failed": self.failed, "life": self.life, "errors": list(self.errors),
                 "total": self.total_judgments, "notes": len(self.notes),
                 "holds": self.holds_total, "holds_done": self.holds_done,
                 "difficulty": self.difficulty}
 
     def spectrum_chunk(self, t):
-        """A chunk of the song around time t, for the little spectrum display."""
         i = int(t * self.sr)
         if i < 0 or i >= len(self.song["mono"]):
             return np.zeros(BLOCK_SIZE, dtype=np.float32)
         return pad_to_block(self.song["mono"][i:i + BLOCK_SIZE])
 
 
-# ------------------------------------------------------- rhythm game screens --
+# rhythm game screens
 def fit_font(text, width, *fonts):
-    """The largest of the given fonts in which the text still fits the width."""
     for font in fonts:
         if font.size(text)[0] <= width:
             return font
@@ -1455,8 +1450,7 @@ def fmt_time(seconds):
 
 
 def run_rhythm_analysis(screen, clock, path):
-    """Chart the song in a helper thread while the window shows progress.
-    Returns ('ok', song), ('error', message), ('menu', None) or ('quit', None)."""
+    # analyze on a thread so the window doesnt freeze
     state = {"frac": 0.0, "text": "starting", "result": None, "error": None}
 
     def report(frac, text):
@@ -1501,13 +1495,12 @@ def run_rhythm_analysis(screen, clock, path):
 
 
 def run_song_select(screen, clock, song, difficulty="normal"):
-    """Pick a difficulty. Returns ('play', difficulty), ('menu', None) or ('quit', None)."""
     names = list(DIFFICULTIES)
     index = names.index(difficulty)
     duration = song["duration"]
     title = song["name"]
     title = title if len(title) <= 40 else title[:38] + ".."
-    rects = [pygame.Rect(40, 226 + i * 104, 500, 92) for i in range(len(names))]
+    rects = [pygame.Rect(40, 226 + i * 68, 500, 62) for i in range(len(names))]
 
     while True:
         for event in pygame.event.get():
@@ -1522,8 +1515,9 @@ def run_song_select(screen, clock, song, difficulty="normal"):
                     index = (index - 1) % len(names)
                 elif event.key in (pygame.K_DOWN, pygame.K_RIGHT):
                     index = (index + 1) % len(names)
-                elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
-                    index = {pygame.K_1: 0, pygame.K_2: 1, pygame.K_3: 2}[event.key]
+                elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5):
+                    index = {pygame.K_1: 0, pygame.K_2: 1, pygame.K_3: 2,
+                             pygame.K_4: 3, pygame.K_5: 4}[event.key]
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 for i, rect in enumerate(rects):
                     if rect.collidepoint(event.pos):
@@ -1550,13 +1544,14 @@ def run_song_select(screen, clock, song, difficulty="normal"):
                 pygame.draw.rect(screen, BLUE, rect)
             else:
                 pygame.draw.line(screen, INK, rect.topleft, rect.topright, 1)
-            draw_text(screen, FONT_MONO, f"0{i + 1}", (rect.left + 16, rect.top + 10), WHITE if hot else BLUE)
-            draw_text(screen, FONT_ROW, name, (rect.left + 14, rect.top + 28), WHITE if hot else INK)
+            name_color = WHITE if hot else (RED if name == "insane" else INK)
+            draw_text(screen, FONT_MONO, f"0{i + 1}", (rect.left + 14, rect.top + 10), WHITE if hot else BLUE)
+            draw_text(screen, FONT_MID, name, (rect.left + 48, rect.top + 3), name_color)
             draw_text(screen, FONT_TINY, f"{notes} NOTES / {holds} HOLDS / {per_sec:.1f} PER SECOND",
-                      (rect.left + 16, rect.bottom - 22), WHITE if hot else INK)
+                      (rect.left + 50, rect.bottom - 18), WHITE if hot else INK)
         pygame.draw.line(screen, INK, rects[-1].bottomleft, rects[-1].bottomright, 1)
 
-        # right: how busy the chart is across the song
+        # density graph
         draw_panel(screen, MENU_PANEL)
         draw_label(screen, FONT_TINY, f"NOTE DENSITY / {names[index].upper()}",
                    (MENU_PANEL.left + 16, MENU_PANEL.top + 14))
@@ -1571,26 +1566,29 @@ def run_song_select(screen, clock, song, difficulty="normal"):
         draw_text(screen, FONT_TINY, "START", (MENU_PANEL.left + 16, base + 10), INK)
         draw_text(screen, FONT_TINY, fmt_time(duration), (MENU_PANEL.right - 16, base + 10), INK, "topright")
 
-        draw_label(screen, FONT_TINY, "KEYS / D F J K", (MENU_PANEL.left + 16, MENU_PANEL.top + 340))
+        draw_label(screen, FONT_TINY, "KEYS / D F J K", (MENU_PANEL.left + 16, MENU_PANEL.top + 326))
         for lane in range(LANES):
-            box = pygame.Rect(MENU_PANEL.left + 16 + lane * 60, MENU_PANEL.top + 366, 52, 52)
+            box = pygame.Rect(MENU_PANEL.left + 16 + lane * 60, MENU_PANEL.top + 350, 52, 52)
             pygame.draw.rect(screen, PAPER, box)
             pygame.draw.rect(screen, INK, box, 1)
             draw_text(screen, FONT_UI, LANE_LABELS[lane], box.center, INK, "center")
+        scale = DIFFICULTIES[names[index]]["window"]
         draw_label(screen, FONT_TINY,
-                   f"PERFECT +-{int(WINDOW_PERFECT * 1000)} MS   GREAT +-{int(WINDOW_GREAT * 1000)} MS   OK +-{int(WINDOW_OK * 1000)} MS",
-                   (MENU_PANEL.left + 16, MENU_PANEL.top + 440))
+                   f"PERFECT +-{round(WINDOW_PERFECT * scale * 1000)} MS   GREAT +-{round(WINDOW_GREAT * scale * 1000)} MS   OK +-{round(WINDOW_OK * scale * 1000)} MS",
+                   (MENU_PANEL.left + 16, MENU_PANEL.top + 416))
+        draw_label(screen, FONT_TINY,
+                   "LIFE / SONG ENDS AT ZERO" if names[index] in FAIL_ON else "LIFE / NO FAIL, JUST A SCORE",
+                   (MENU_PANEL.left + 16, MENU_PANEL.top + 438))
         draw_label(screen, FONT_TINY, "IN GAME: UP/DOWN SPEED   LEFT/RIGHT SYNC   ESC PAUSE",
-                   (MENU_PANEL.left + 16, MENU_PANEL.top + 466))
+                   (MENU_PANEL.left + 16, MENU_PANEL.top + 460))
         draw_label(screen, FONT_TINY, "LONG NOTES: HOLD THE KEY UNTIL THE TAIL ENDS",
-                   (MENU_PANEL.left + 16, MENU_PANEL.top + 490))
+                   (MENU_PANEL.left + 16, MENU_PANEL.top + 482))
 
         pygame.display.flip()
         clock.tick(FPS)
 
 
 def draw_note(screen, lx, note, now, speed, holding=False):
-    """One note: a block, plus a body and tail cap if it's a long note."""
     head_y = int(HIT_Y - (note["t"] - now) * speed)
     if note["len"] > 0:
         tail_y = int(HIT_Y - (note["end"] - now) * speed)
@@ -1599,15 +1597,14 @@ def draw_note(screen, lx, note, now, speed, holding=False):
             body = pygame.Rect(lx + 24, tail_y, LANE_W - 48, bottom - tail_y)
             pygame.draw.rect(screen, BLUE if holding else (150, 192, 250), body)
             pygame.draw.rect(screen, INK, body, 2)
-        pygame.draw.rect(screen, INK, (lx + 7, tail_y - 6, LANE_W - 14, 8))      # the tail cap
+        pygame.draw.rect(screen, INK, (lx + 7, tail_y - 6, LANE_W - 14, 8))  # tail
     if holding:
-        head_y = HIT_Y                                   # the head waits on the line
+        head_y = HIT_Y
     pygame.draw.rect(screen, INK, (lx + 7, head_y - 11, LANE_W - 14, 22))
     pygame.draw.rect(screen, RED if holding else BLUE, (lx + 7, head_y - 11, LANE_W - 14, 5))
 
 
 def draw_field(screen, game, now):
-    """The playfield: sky, lanes, falling notes, hit line, key boxes, flashes."""
     if "field" not in _cache:
         surf = get_sky(FIELD.size).copy()
         for lane in range(LANES):
@@ -1626,7 +1623,7 @@ def draw_field(screen, game, now):
     screen.set_clip(FIELD)
     for lane in range(LANES):
         lx = lane_x(lane)
-        # notes still to be played, between just-passed and just-appearing
+        # only draw notes that are on screen
         times, notes = game.lane_times[lane], game.lanes[lane]
         lookahead = (HIT_Y - FIELD.top + 30) / game.speed
         lo = bisect.bisect_left(times, now - 0.25)
@@ -1634,31 +1631,30 @@ def draw_field(screen, game, now):
         for note in notes[lo:hi]:
             if note["state"] is None:
                 draw_note(screen, lx, note, now, game.speed)
-        if game.active[lane]:                            # a long note being held right now
+        if game.active[lane]:
             pygame.draw.rect(screen, BLUE, (lx + 8, HIT_Y - 60, LANE_W - 16, 60))
             draw_note(screen, lx, game.active[lane], now, game.speed, holding=True)
-        # flash when a note is hit
         age = wall - game.flash[lane]
-        if age < 0.2:
+        if age < 0.2:  # hit flash
             h = int(70 * (1 - age / 0.2))
             pygame.draw.rect(screen, BLUE, (lx + 8, HIT_Y - h, LANE_W - 16, h))
     screen.set_clip(None)
 
     pygame.draw.line(screen, INK, (FIELD.left, HIT_Y), (FIELD.right - 1, HIT_Y), 3)
-    for lane in range(LANES):                                   # key boxes
+    for lane in range(LANES):
         box = pygame.Rect(lane_x(lane) + 4, HIT_Y + 16, LANE_W - 8, 50)
         down = bool(held[LANE_KEYS[lane]])
         pygame.draw.rect(screen, BLUE if down else PAPER, box)
         pygame.draw.rect(screen, INK, box, 1)
         draw_text(screen, FONT_UI, LANE_LABELS[lane], box.center, WHITE if down else INK, "center")
 
-    if game.judgement and wall - game.judgement[1] < 0.5:      # PERFECT / GREAT / OK / MISS
+    if game.judgement and wall - game.judgement[1] < 0.5:
         name, _, error, label = game.judgement
         text = label or (name.upper() + ("" if error is None else f"  {error * 1000:+.0f}"))
         draw_label(screen, FONT_UI, text, (FIELD.centerx, HIT_Y - 130), JUDGE_COLOR[name]
                    if name != "miss" else WHITE, PAPER if name != "miss" else RED, "midtop", pad=14)
 
-    if now < 0:                                                 # countdown
+    if now < 0:  # countdown
         digit = str(int(-now) + 1)
         draw_label(screen, FONT_HUGE, digit, (FIELD.centerx, FIELD.top + 150), INK, PAPER, "midtop", pad=24)
         draw_label(screen, FONT_MONO, "GET READY", (FIELD.centerx, FIELD.top + 290), INK, PAPER, "midtop", pad=12)
@@ -1667,7 +1663,6 @@ def draw_field(screen, game, now):
 
 
 def run_game(screen, clock, song, difficulty):
-    """Play one song. Returns ('done', result), ('retry', None), ('menu', None) or ('quit', None)."""
     game = RhythmGame(song, difficulty)
     bar_bins = build_bar_bins(song["sr"])
     smoothed, peaks = np.zeros(NUM_BARS), np.zeros(NUM_BARS)
@@ -1690,7 +1685,7 @@ def run_game(screen, clock, song, difficulty):
                 if game.paused:
                     if event.key in (pygame.K_RETURN, pygame.K_ESCAPE):
                         game.set_paused(False)
-                        pressed = pygame.key.get_pressed()               # let go while paused?
+                        pressed = pygame.key.get_pressed()  # check if keys were let go while paused
                         for lane in range(LANES):
                             if game.down[lane] and not pressed[LANE_KEYS[lane]]:
                                 game.release(lane)
@@ -1713,7 +1708,7 @@ def run_game(screen, clock, song, difficulty):
                     game.offset = RHYTHM["offset"] = min(0.3, game.offset + 0.005)
 
             if not game.paused:
-                if any(game.active):                     # safety net if a key-up event never arrives
+                if any(game.active):  # in case keyup gets missed
                     pressed = pygame.key.get_pressed()
                     for lane in range(LANES):
                         if game.active[lane] and game.down[lane] and not pressed[LANE_KEYS[lane]]:
@@ -1737,17 +1732,22 @@ def run_game(screen, clock, song, difficulty):
                         f"{clock.get_fps():.0f} FPS")
             draw_field(screen, game, now)
 
-            # ---- left column: score, combo, accuracy, spectrum ----------------------
+            # left side
             draw_text(screen, FONT_TINY, "SCORE", (40, 104), GREY)
             draw_text(screen, FONT_TITLE, f"{game.score:07d}", (38, 120), INK)
             draw_text(screen, FONT_TINY, "COMBO", (40, 200), GREY)
             draw_text(screen, FONT_HUGE, str(game.combo), (34, 212), BLUE if game.combo >= 10 else INK)
             draw_text(screen, FONT_TINY, "ACCURACY", (40, 342), GREY)
             draw_text(screen, FONT_TITLE, f"{game.accuracy(True) * 100:5.1f}%", (38, 358), INK)
-            draw_text(screen, FONT_MONO, f"BEST COMBO {game.max_combo}", (40, 430), INK)
+            draw_text(screen, FONT_MONO, f"BEST COMBO {game.max_combo}", (40, 428), INK)
+            draw_text(screen, FONT_TINY, "LIFE / RUN ENDS AT ZERO" if game.difficulty in FAIL_ON else "LIFE / NO FAIL",
+                      (40, 452), GREY)
+            pygame.draw.rect(screen, GREY, (40, 470, 300, 8))
+            pygame.draw.rect(screen, BLUE if game.life > 30 else RED, (40, 470, int(300 * game.life / 100), 8))
+            pygame.draw.rect(screen, INK, (40, 470, 300, 8), 1)
             draw_bars(screen, smoothed, peaks, spectrum_area, 0.85)
 
-            # ---- right column: judgements, progress, settings ------------------------
+            # right side
             x = 780
             draw_text(screen, FONT_TINY, "JUDGEMENTS", (x, 104), GREY)
             for i, name in enumerate(("perfect", "great", "ok", "miss")):
@@ -1785,7 +1785,6 @@ def run_game(screen, clock, song, difficulty):
 
 
 def run_results(screen, clock, song, result):
-    """Show the score. Returns 'retry', 'select', 'menu' or 'quit'."""
     errors = result["errors"]
     mean_ms = float(np.mean(errors)) * 1000 if len(errors) >= 15 else None
     hist, _ = np.histogram([e * 1000 for e in errors], bins=15, range=(-135, 135))
@@ -1813,12 +1812,14 @@ def run_results(screen, clock, song, result):
                         note = f"SYNC SET TO {RHYTHM['offset'] * 1000:+.0f} MS"
 
         draw_chrome(screen, "results.",
-                    [title.upper(), f"{result['difficulty'].upper()} / {result['notes']} NOTES / {result['holds']} HOLDS", "SONG COMPLETE"],
+                    [title.upper(), f"{result['difficulty'].upper()} / {result['notes']} NOTES / {result['holds']} HOLDS",
+                     "SONG FAILED" if result.get("failed") else "SONG COMPLETE"],
                     "ENTER = PLAY AGAIN     D = CHANGE DIFFICULTY     A = APPLY SYNC     ESC = MENU",
                     f"{clock.get_fps():.0f} FPS")
 
         draw_text(screen, FONT_TINY, "GRADE", (40, 100), GREY)
-        draw_text(screen, FONT_HUGE, result["grade"] + ".", (34, 112), BLUE if result["grade"] in "SA" else INK)
+        draw_text(screen, FONT_HUGE, result["grade"] + ".", (34, 112),
+                  RED if result["grade"] == "F" else (BLUE if result["grade"] in "SA" else INK))
         draw_text(screen, FONT_TINY, "SCORE", (300, 108), GREY)
         draw_text(screen, FONT_TITLE, f"{result['score']:07d}", (298, 124), INK)
         draw_text(screen, FONT_TINY, "ACCURACY", (300, 196), GREY)
@@ -1835,6 +1836,7 @@ def run_results(screen, clock, song, result):
             draw_text(screen, FONT_ROW, name, (72, y - 8), INK)
             draw_text(screen, FONT_ROW, str(counts[name]), (540, y - 8), INK, "topright")
 
+        # timing histogram
         draw_panel(screen, MENU_PANEL)
         draw_label(screen, FONT_TINY, "HOW EARLY OR LATE YOU WERE / MS", (MENU_PANEL.left + 16, MENU_PANEL.top + 14))
         base, width = MENU_PANEL.top + 250, MENU_PANEL.w - 32
@@ -1864,7 +1866,6 @@ def run_results(screen, clock, song, result):
 
 
 def run_rhythm(screen, clock):
-    """The whole rhythm-game flow. Returns ('menu'|'quit'|'error', message)."""
     path = pick_file()
     if not path:
         return "menu", None
@@ -1892,12 +1893,9 @@ def run_rhythm(screen, clock):
             return choice, None
 
 
-# -------------------------------------------------------------- visualizer --
+# visualizer
 def start_source(screen, clock, source, info):
-    """Open the audio (and camera) in a helper thread while the window keeps
-    updating. If the audio driver gets stuck, you get an error after a few
-    seconds instead of a frozen window. Returns None when ready, or 'menu' /
-    'quit' if you gave up while it was opening."""
+    # open audio/camera on a thread so window doesnt freeze if the driver hangs
     state = {"error": None, "abandoned": False}
 
     def work():
@@ -1906,7 +1904,7 @@ def start_source(screen, clock, source, info):
         except Exception as err:
             state["error"] = err
             return
-        if state["abandoned"]:            # you left before it finished opening
+        if state["abandoned"]:
             source.stop()
 
     thread = threading.Thread(target=work, daemon=True)
@@ -1931,7 +1929,7 @@ def start_source(screen, clock, source, info):
 
         if time.time() - began > START_TIMEOUT:
             state["abandoned"] = True
-            print(f"\n{source.name} didn't open within {START_TIMEOUT}s. Where each thread is stuck:")
+            print(f"\n{source.name} didnt open after {START_TIMEOUT}s, thread dump:")
             faulthandler.dump_traceback(all_threads=True)
             raise RuntimeError(f"{source.name} didn't respond after {START_TIMEOUT}s "
                                "(see the terminal for details)")
@@ -1942,7 +1940,6 @@ def start_source(screen, clock, source, info):
 
 
 def run_visualizer(screen, clock, source):
-    """Draw the bars for one source. Returns 'menu' or 'quit'."""
     pygame.display.set_caption(f"{source.name} - audio visualizer")
 
     bar_bins = build_bar_bins(source.sample_rate)
@@ -1973,7 +1970,7 @@ def run_visualizer(screen, clock, source):
             target = compute_bars(source.get_segment(), bar_bins,
                                   source.db_floor, source.db_ceil, source.tilt)
 
-            # fast up -> down
+            # jump up, fall slowly
             smoothed = np.where(target > smoothed, target, smoothed - FALL_SPEED)
             smoothed = np.clip(smoothed, 0.0, 1.0)
             peaks = np.where(smoothed > peaks, smoothed, peaks - 0.008)
@@ -1998,10 +1995,10 @@ def run_visualizer(screen, clock, source):
     return result
 
 
-# -------------------------------------------------------------------- main --
 def main():
-    pygame.display.init()        # not pygame.init(): its audio system isn't used here
-    pygame.font.init()           # and can get in the way of sounddevice
+    # dont use pygame.init() - pygame audio messes with sounddevice
+    pygame.display.init()
+    pygame.font.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     init_theme()
     clock = pygame.time.Clock()
@@ -2034,7 +2031,7 @@ def main():
             else:
                 path = pick_file()
                 if not path:
-                    continue                  # dialog cancelled, back to menu
+                    continue
                 source = FileSource(path)
         except Exception as err:
             what = "that file" if choice == "file" else "that mode"
